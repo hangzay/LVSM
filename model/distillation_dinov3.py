@@ -6,6 +6,10 @@ from einops import rearrange
 from transformers import AutoImageProcessor, AutoModel
 
 class DinoLVSMComparator(nn.Module):
+    SUPPORTED_MODELS = {
+        "vitl16": "facebook/dinov3-vitl16-pretrain-lvd1689m",
+        "vitb16": "facebook/dinov3-vitb16-pretrain-lvd1689m"
+    }
 
     def __init__(
         self, 
@@ -64,7 +68,7 @@ class DinoLVSMComparator(nn.Module):
     def project_lvsm_features(self, lvsm_mid_features):
         return self.proj_head(lvsm_mid_features)
     
-    def compute_loss(self, lvsm_features, dino_features, loss_type='l2'):
+    def compute_distill_loss(self, lvsm_features, dino_features, loss_type='l2'):
         """
         计算LVSM投影特征与DINOv3特征之间的损失
         
@@ -114,19 +118,17 @@ class DinoLVSMComparator(nn.Module):
         else:
             raise ValueError(f"不支持的损失函数类型: {loss_type}，可选类型为'l2', 'cos_sim', 'smooth_l1', 'cross_entropy'")
     
-    def distillation_block(self, images_clean, lvsm_mid_features, layer_idx=-2, loss_type='l2'):
+    def get_distillation_features(self, images_clean, lvsm_mid_features, layer_idx=-2):
         """
-        蒸馏过程封装：接收干净图片集和LVSM中间层信息，输出最终蒸馏损失
+        获取蒸馏所需的特征
         
         Args:
             images_clean: 干净图片集，形状为[B, T, H, W]
             lvsm_mid_features: LVSM模型的中间层特征，形状为[B, T, N_lvsm, D_lvsm]
-            layer_idx: DINOv3提取特征的中间层索引，默认-2
-            loss_type: 损失函数类型，默认'l2'，可选'l2', 'cos_sim', 'smooth_l1', 'cross_entropy'
+            layer_idx: DINOv3提取特征的中间层索引
             
         Returns:
-            distill_loss: 蒸馏损失，可直接用于反向传播更新LVSM参数
-            optional_outputs: 字典，包含中间特征（教师特征、投影后学生特征），便于调试分析
+            包含教师特征和学生投影特征的字典
         """
         device = next(self.dino_model.parameters()).device
         images_clean = images_clean.to(device)
@@ -135,16 +137,8 @@ class DinoLVSMComparator(nn.Module):
         dino_teacher_feats = self.get_dino_patch_features(images_clean, layer_idx)
         lvsm_student_proj = self.project_lvsm_features(lvsm_mid_features)
         
-        distill_loss = self.compute_loss(
-            lvsm_features=lvsm_student_proj,
-            dino_features=dino_teacher_feats,
-            loss_type=loss_type
-        )
-        
-        optional_outputs = {
+        return {
             "dino_teacher_features": dino_teacher_feats,
             "lvsm_projected_features": lvsm_student_proj
         }
-        
-        return distill_loss, optional_outputs
 

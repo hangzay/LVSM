@@ -9,6 +9,7 @@ from torchvision.models import vgg19
 import scipy.io
 import os
 from pathlib import Path
+from einops import rearrange
 
 
 # the perception loss code is modified from https://github.com/zhengqili/Crowdsampling-the-Plenoptic-Function/blob/f5216f312cf82d77f8d20454b5eeb3930324630a/models/networks.py#L1478
@@ -123,6 +124,9 @@ class LossComputer(nn.Module):
         super().__init__()
         self.config = config
 
+        self.distill_loss_weight = self.config.training.get('distill_loss_weight', 0.1)
+        self.distill_loss_type = self.config.training.get('distill_loss_type', 'l2')
+
         if self.config.training.lpips_loss_weight > 0.0:
             # avoid multiple GPUs from downloading the same LPIPS model multiple times
             if torch.distributed.get_rank() == 0:
@@ -140,10 +144,51 @@ class LossComputer(nn.Module):
             param.requires_grad = False
         return module
 
+    def compute_distill_loss(self, lvsm_features, dino_features):
+        """计算蒸馏损失（整合原DinoLVSMComparator中的损失计算逻辑）"""
+        # 维度检查
+        assert lvsm_features.shape[:2] == dino_features.shape[:2], \
+            f"批次和时间维度不匹配：LVSM为{lvsm_features.shape[:2]}，DINO为{dino_features.shape[:2]}"
+        assert lvsm_features.shape[-1] == dino_features.shape[-1], \
+            f"特征维度不匹配：LVSM为{lvsm_features.shape[-1]}，DINO为{dino_features.shape[-1]}"
+        
+        # 展平批次和时间维度
+        lvsm_flat = rearrange(lvsm_features, "b t n d -> (b t) n d")
+        dino_flat = rearrange(dino_features, "b t n d -> (b t) n d")
+        
+        if self.distill_loss_type == 'l2':
+            return torch.mean(F.mse_loss(lvsm_flat, dino_flat, reduction='none'), dim=[1, 2]).mean()
+            
+        elif self.distill_loss_type == 'cos_sim':
+            lvsm_norm = F.normalize(lvsm_flat, p=2, dim=-1)
+            dino_norm = F.normalize(dino_flat, p=2, dim=-1)
+            cos_sim = torch.mean(torch.sum(lvsm_norm * dino_norm, dim=-1), dim=1).mean()
+            return 1 - cos_sim
+            
+        elif self.distill_loss_type == 'smooth_l1':
+            return torch.mean(F.smooth_l1_loss(lvsm_flat, dino_flat, reduction='none'), dim=[1, 2]).mean()
+            
+        elif self.distill_loss_type == 'cross_entropy':
+            _, n_patches_dino, _ = dino_flat.shape
+            lvsm_norm = F.normalize(lvsm_flat, p=2, dim=-1)
+            dino_norm = F.normalize(dino_flat, p=2, dim=-1)
+            
+            sim_matrix = torch.matmul(lvsm_norm, dino_norm.transpose(1, 2))
+            labels = sim_matrix.argmax(dim=2)
+            
+            return F.cross_entropy(
+                sim_matrix.reshape(-1, n_patches_dino),
+                labels.reshape(-1)
+            )
+            
+        else:
+            raise ValueError(f"不支持的蒸馏损失函数类型: {self.distill_loss_type}，可选类型为'l2', 'cos_sim', 'smooth_l1', 'cross_entropy'")
+
     def forward(
         self,
         rendering,
         target,
+        distill_features=None
     ):
         """
         Calculate various losses between rendering and target images.
@@ -151,6 +196,7 @@ class LossComputer(nn.Module):
         Args:
             rendering: [b, v, 3, h, w], value range [0, 1]
             target: [b, v, 3, h, w], value range [0, 1]
+            distill_features: dino_teacher_features,lvsm_projected_features
         
         Returns:
             Dictionary of loss metrics
@@ -180,11 +226,18 @@ class LossComputer(nn.Module):
         if self.config.training.perceptual_loss_weight > 0.0:
             perceptual_loss = self.perceptual_loss_module(rendering, target)
 
+        distill_loss = torch.tensor(0.0).to(l2_loss.device)
+        if self.distill_loss_weight > 0.0 and distill_features is not None:
+            distill_loss = self.compute_distill_loss(
+                lvsm_features=distill_features["lvsm_projected_features"],
+                dino_features=distill_features["dino_teacher_features"]
+            )
 
         loss = (
             self.config.training.l2_loss_weight * l2_loss
             + self.config.training.lpips_loss_weight * lpips_loss
             + self.config.training.perceptual_loss_weight * perceptual_loss
+            + self.distill_loss_weight * distill_loss
         )
 
 
@@ -194,6 +247,7 @@ class LossComputer(nn.Module):
             psnr=psnr,
             lpips_loss=lpips_loss,
             perceptual_loss=perceptual_loss,
+            distill_loss=distill_loss,
             norm_perceptual_loss=perceptual_loss / l2_loss, 
             norm_lpips_loss=lpips_loss / l2_loss
         )
