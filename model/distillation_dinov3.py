@@ -11,15 +11,14 @@ class DinoLVSMComparator(nn.Module):
         self, 
         lvsm_feature_dim, 
         dino_feature_dim, 
-        num_layers=2
+        num_layers=2,
+        dino_model_type="vitl16"
         ):
         super().__init__()
-        self.dino_processor = AutoImageProcessor.from_pretrained(
-            "facebook/dinov3-vitl16-pretrain-lvd1689m"
-        )
-        self.dino_model = AutoModel.from_pretrained(
-            "facebook/dinov3-vitl16-pretrain-lvd1689m"
-        )
+        model_name = self.SUPPORTED_MODELS[dino_model_type]
+        self.dino_processor = AutoImageProcessor.from_pretrained(model_name)
+        self.dino_model = AutoModel.from_pretrained(model_name)
+        
         self.dino_model.eval()
         for param in self.dino_model.parameters():
             param.requires_grad = False
@@ -30,7 +29,7 @@ class DinoLVSMComparator(nn.Module):
                 proj_layers.append(nn.Linear(lvsm_feature_dim, dino_feature_dim))
             else:
                 proj_layers.append(nn.Linear(dino_feature_dim, dino_feature_dim))
-            proj_layers.append(nn.GELU())
+            proj_layers.append(nn.SiLU())
         self.proj_head = nn.Sequential(*proj_layers)
         self.proj_head.apply(init_weights)
         
@@ -99,7 +98,6 @@ class DinoLVSMComparator(nn.Module):
             return self.mean_flat(self.smooth_l1_loss(lvsm_flat, dino_flat))
             
         elif loss_type == 'cross_entropy':
-            batch_size_flat, n_patches_lvsm, _ = lvsm_flat.shape
             _, n_patches_dino, _ = dino_flat.shape
 
             lvsm_norm = F.normalize(lvsm_flat, p=2, dim=-1)
